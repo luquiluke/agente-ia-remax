@@ -7,45 +7,57 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _get(key: str, default: str = "") -> str:
+    """Lee de env vars (local/.env) y cae a st.secrets (Streamlit Cloud)."""
+    val = os.getenv(key, "")
+    if not val:
+        try:
+            import streamlit as st
+            val = str(st.secrets.get(key, default))
+        except Exception:
+            val = default
+    return val
+
+
 class Settings:
     # ── OpenAI ────────────────────────────────────────────────────────────────
-    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    OPENAI_API_KEY: str = _get("OPENAI_API_KEY")
+    OPENAI_MODEL: str = _get("OPENAI_MODEL", "gpt-4o-mini")
 
     # ── ReMax / Scraping ──────────────────────────────────────────────────────
-    REMAX_EMAIL: str = os.getenv("REMAX_EMAIL", "")
-    REMAX_PASSWORD: str = os.getenv("REMAX_PASSWORD", "")
-    REMAX_TABLA: str = os.getenv("REMAX_TABLA", "0.60")          # % del bruto que retiene el agente
-    COMISION_BRUTA_PCT: str = os.getenv("COMISION_BRUTA_PCT", "0.04")  # 4% default total
+    REMAX_EMAIL: str = _get("REMAX_EMAIL")
+    REMAX_PASSWORD: str = _get("REMAX_PASSWORD")
+    REMAX_TABLA: str = _get("REMAX_TABLA", "0.60")          # % del bruto que retiene el agente
+    COMISION_BRUTA_PCT: str = _get("COMISION_BRUTA_PCT", "0.04")  # 4% default total
 
     # ── Google Sheets ─────────────────────────────────────────────────────────
-    GOOGLE_SHEETS_CREDENTIALS: str = os.getenv(
+    GOOGLE_SHEETS_CREDENTIALS: str = _get(
         "GOOGLE_SHEETS_CREDENTIALS", "credentials/service_account.json"
     )
-    GOOGLE_SPREADSHEET_ID: str = os.getenv("GOOGLE_SPREADSHEET_ID", "")
-    PROPIEDADES_SHEET: str = os.getenv("PROPIEDADES_SHEET", "propiedades")
-    DEALS_SHEET: str = os.getenv("DEALS_SHEET", "deals")
-    CLIENTES_SHEET: str = os.getenv("CLIENTES_SHEET", "clientes")
+    GOOGLE_SPREADSHEET_ID: str = _get("GOOGLE_SPREADSHEET_ID")
+    PROPIEDADES_SHEET: str = _get("PROPIEDADES_SHEET", "propiedades")
+    DEALS_SHEET: str = _get("DEALS_SHEET", "deals")
+    CLIENTES_SHEET: str = _get("CLIENTES_SHEET", "clientes")
 
     # ── Gmail SMTP ────────────────────────────────────────────────────────────
-    GMAIL_ADDRESS: str = os.getenv("GMAIL_ADDRESS", "")
-    GMAIL_APP_PASSWORD: str = os.getenv("GMAIL_APP_PASSWORD", "")
-    REPORT_RECIPIENT_EMAIL: str = os.getenv("REPORT_RECIPIENT_EMAIL", "")
+    GMAIL_ADDRESS: str = _get("GMAIL_ADDRESS")
+    GMAIL_APP_PASSWORD: str = _get("GMAIL_APP_PASSWORD")
+    REPORT_RECIPIENT_EMAIL: str = _get("REPORT_RECIPIENT_EMAIL")
 
     # ── Google Calendar ───────────────────────────────────────────────────────
-    GOOGLE_CALENDAR_ID: str = os.getenv("GOOGLE_CALENDAR_ID", "primary")
+    GOOGLE_CALENDAR_ID: str = _get("GOOGLE_CALENDAR_ID", "primary")
 
     # ── Tipo de cambio (fallback si no hay API) ───────────────────────────────
-    TC_BLUE: str = os.getenv("TC_BLUE", "1250")          # ARS por USD (blue)
-    TC_OFICIAL: str = os.getenv("TC_OFICIAL", "1100")    # ARS por USD (oficial BNA)
+    TC_BLUE: str = _get("TC_BLUE", "1250")          # ARS por USD (blue)
+    TC_OFICIAL: str = _get("TC_OFICIAL", "1100")    # ARS por USD (oficial BNA)
 
     # ── Scanner ───────────────────────────────────────────────────────────────
-    SCANNER_MAX_PROPIEDADES: int = int(os.getenv("SCANNER_MAX_PROPIEDADES", "50"))
-    SCANNER_PRECIO_MIN_USD: int = int(os.getenv("SCANNER_PRECIO_MIN_USD", "50000"))
-    SCANNER_PRECIO_MAX_USD: int = int(os.getenv("SCANNER_PRECIO_MAX_USD", "500000"))
+    SCANNER_MAX_PROPIEDADES: int = int(_get("SCANNER_MAX_PROPIEDADES", "50"))
+    SCANNER_PRECIO_MIN_USD: int = int(_get("SCANNER_PRECIO_MIN_USD", "50000"))
+    SCANNER_PRECIO_MAX_USD: int = int(_get("SCANNER_PRECIO_MAX_USD", "500000"))
 
     # ── Contraseña interna (modo agente) ─────────────────────────────────────
-    INTERNAL_PASSWORD: str = os.getenv("INTERNAL_PASSWORD", "remax2026")
+    INTERNAL_PASSWORD: str = _get("INTERNAL_PASSWORD", "remax2026")
 
     # ── Propiedades calculadas ────────────────────────────────────────────────
     @property
