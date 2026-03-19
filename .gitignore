@@ -1,0 +1,29 @@
+# Entorno virtual
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Variables de entorno (contiene API keys)
+.env
+
+# Credenciales Google (contiene service account keys)
+credentials/*.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Playwright
+playwright/.local-chromium/
+
+# Build
+*.egg-info/
+dist/
+build/
