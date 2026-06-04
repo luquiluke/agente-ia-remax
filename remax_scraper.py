@@ -1,18 +1,21 @@
 """
 remax_scraper.py — Scraper de propiedades ReMax Argentina
 ──────────────────────────────────────────────────────────
-Modo 1 (autenticado): Playwright con login en remax.com.ar
-Modo 2 (público):     requests + BeautifulSoup sobre listados públicos
-Modo 3 (demo):        datos mock realistas de CABA (siempre disponible)
+Modo 1 (live):  API JSON pública de ReMax Argentina (sin login)
+                api-ar.redremax.com/remaxweb-ar/api/listings/findAll
+Modo 2 (demo):  datos mock realistas de CABA (fallback si la API falla)
 
-La app funciona en modo demo sin credenciales.
+La app funciona sin credenciales: consulta ReMax en vivo y cae a demo
+automáticamente si no hay conexión.
 """
 from __future__ import annotations
 
+import json
 import random
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from config import settings
 
@@ -398,170 +401,205 @@ def _generar_mock_propiedades() -> list[PropiedadRemax]:
     return propiedades
 
 
-# ─── Scraper público (requests + BS4) ────────────────────────────────────────
+# ─── Scraper API pública de ReMax Argentina ──────────────────────────────────
+# remax.com.ar es una SPA React respaldada por una API JSON pública (sin login).
+# El front-end consume este endpoint; lo usamos directamente — es mucho más
+# confiable que parsear el HTML renderizado o automatizar el login con Playwright.
 
-def _scrape_publico(
+REMAX_API_URL = "https://api-ar.redremax.com/remaxweb-ar/api/listings/findAll"
+REMAX_API_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Accept-Language": "es-AR,es;q=0.9",
+}
+
+# operation.value → operacion normalizada
+_OP_VALUE_MAP = {"sale": "Venta", "rent": "Alquiler"}
+# type.value → tipo normalizado
+_TIPO_VALUE_MAP = {
+    "departamento": "Departamento", "casa": "Casa", "ph": "PH",
+    "local": "Local", "terreno": "Terreno", "oficina": "Oficina",
+    "cochera": "Cochera", "galpon": "Galpón", "campo": "Campo",
+}
+# operacion (input) → operationId del API
+_OPERACION_ID = {"venta": 1, "alquiler": 2}
+
+# Particiones GBA para inferir zona desde el partido (addressInfo)
+_GBA_NORTE = {"vicente lopez", "san isidro", "tigre", "san fernando", "pilar",
+              "escobar", "malvinas argentinas", "jose c paz", "san miguel"}
+_GBA_OESTE = {"la matanza", "moron", "moreno", "merlo", "ituzaingo", "hurlingham",
+              "tres de febrero", "general san martin", "san martin"}
+_GBA_SUR = {"avellaneda", "lanus", "lomas de zamora", "quilmes", "berazategui",
+            "florencio varela", "almirante brown", "esteban echeverria",
+            "ezeiza", "presidente peron"}
+
+
+def _zona_desde_address(address_info: str) -> str:
+    """Infiere la zona (CABA / GBA Norte/Oeste/Sur) desde el addressInfo del API."""
+    low = (address_info or "").lower()
+    if "capital federal" in low:
+        return "CABA"
+    if "buenos aires" not in low:
+        return "Otra"  # otra provincia (Córdoba, Santa Fe, etc.)
+    partidos = [p.strip().lower() for p in low.split(",")]
+    for p in partidos:
+        if p in _GBA_NORTE:
+            return "GBA Norte"
+        if p in _GBA_OESTE:
+            return "GBA Oeste"
+        if p in _GBA_SUR:
+            return "GBA Sur"
+    return "GBA Norte"  # default razonable para Buenos Aires provincia
+
+
+def _item_a_propiedad(it: dict) -> Optional[PropiedadRemax]:
+    """Mapea un item del API de ReMax a PropiedadRemax. None si no es usable."""
+    currency = (it.get("currency") or {}).get("value")
+    precio = float(it.get("price") or 0)
+    if currency != "USD" or precio <= 0:
+        return None  # el scanner razona en USD; descartamos ARS / sin precio
+
+    address_info = it.get("addressInfo") or ""
+    barrio = address_info.split(",")[0].strip() if address_info else "Buenos Aires"
+
+    superficie = (it.get("dimensionCovered")
+                  or it.get("dimensionTotalBuilt")
+                  or it.get("dimensionLand") or 0)
+
+    expensas = it.get("expensesPrice") or 0
+    expensas_cur = (it.get("expensesCurrency") or {}).get("value")
+
+    rooms = int(it.get("totalRooms") or 0)
+    assoc = it.get("associate") or {}
+    emails = assoc.get("emails") or []
+    slug = it.get("slug") or ""
+
+    return PropiedadRemax(
+        id=str(it.get("internalId") or it.get("id") or "")[:24],
+        titulo=it.get("title") or "Propiedad ReMax",
+        barrio=barrio,
+        zona=_zona_desde_address(address_info),
+        tipo=_TIPO_VALUE_MAP.get((it.get("type") or {}).get("value", ""), "Departamento"),
+        operacion=_OP_VALUE_MAP.get((it.get("operation") or {}).get("value", ""), "Venta"),
+        precio_usd=precio,
+        superficie_m2=float(superficie or 0),
+        ambientes=rooms,
+        dormitorios=max(rooms - 1, 0),
+        banos=int(it.get("bathrooms") or 0),
+        expensas_ars=float(expensas) if expensas_cur == "ARS" else 0.0,
+        antiguedad_anos=0,
+        dias_en_mercado=0,  # el payload de listado no expone fecha de publicación
+        url=f"https://www.remax.com.ar/listings/{slug}" if slug else "",
+        agente_nombre=assoc.get("name", ""),
+        agente_email=emails[0]["value"] if emails else "",
+        descripcion=address_info,
+    )
+
+
+# ─── Días en mercado (DOM) por seguimiento local ──────────────────────────────
+# El API de ReMax NO expone fecha de publicación (ordena por -createdAt pero no
+# devuelve el valor). Para tener DOM real registramos cuándo vimos cada listing
+# por primera vez y acumulamos. Empieza en 0 y se vuelve preciso a medida que el
+# scanner corre día a día. (En Streamlit Cloud el filesystem es efímero, así que
+# allí el historial puede reiniciarse entre deploys.)
+
+_FIRST_SEEN_PATH = Path(__file__).parent / "data" / "listing_first_seen.json"
+
+
+def _load_first_seen() -> dict:
+    try:
+        return json.loads(_FIRST_SEEN_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_first_seen(store: dict) -> None:
+    try:
+        _FIRST_SEEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _FIRST_SEEN_PATH.write_text(json.dumps(store), encoding="utf-8")
+    except Exception:
+        pass  # sin persistencia (p.ej. FS de solo lectura) → DOM queda en 0
+
+
+def _aplicar_dom(propiedades: list[PropiedadRemax]) -> None:
+    """Asigna dias_en_mercado según la primera vez que vimos cada propiedad."""
+    store = _load_first_seen()
+    hoy = date.today()
+    nuevos = False
+    for p in propiedades:
+        if not p.id:
+            continue
+        visto = store.get(p.id)
+        if visto:
+            try:
+                p.dias_en_mercado = max((hoy - date.fromisoformat(visto)).days, 0)
+                continue
+            except ValueError:
+                pass  # fecha corrupta → re-registrar
+        store[p.id] = hoy.isoformat()
+        p.dias_en_mercado = 0
+        nuevos = True
+    if nuevos:
+        _save_first_seen(store)
+
+
+def _scrape_api(
     barrios: list[str] | None = None,
     precio_min: int = 50_000,
     precio_max: int = 500_000,
-    tipo: str = "departamento",
-    max_resultados: int = 30,
+    operacion: str = "venta",
+    max_resultados: int = 50,
+    page_cap: int = 12,
 ) -> list[PropiedadRemax]:
     """
-    Scraping público de remax.com.ar (sin login).
+    Trae propiedades desde la API pública de ReMax Argentina (sin login).
+
+    El servidor ignora los filtros de precio y ubicación, así que paginamos
+    sobre los listados más nuevos y filtramos en el cliente por precio y barrio.
     Retorna lista vacía si falla — la app cae a mock data.
     """
     try:
         import requests
-        from bs4 import BeautifulSoup
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "es-AR,es;q=0.9",
-        }
+        op_id = _OPERACION_ID.get((operacion or "venta").lower(), 1)
+        barrios_lower = {b.lower() for b in barrios} if barrios else None
+        page_size = 50
+        out: list[PropiedadRemax] = []
 
-        # URL base de listados públicos ReMax Argentina
-        base_url = "https://www.remax.com.ar/listings/buy"
-        params = {
-            "pageNumber": 0,
-            "pageSize": min(max_resultados, 24),
-            "sort": "NEWEST",
-            "lang": "es-AR",
-        }
-        if precio_min:
-            params["priceMin"] = precio_min
-        if precio_max:
-            params["priceMax"] = precio_max
+        with requests.Session() as s:
+            s.headers.update(REMAX_API_HEADERS)
+            for page in range(page_cap):
+                params = {
+                    "page": page,
+                    "pageSize": page_size,
+                    "sort": "-createdAt",
+                    "in:operationId": op_id,
+                    "filterCount": 1,
+                    "viewMode": "listViewMode",
+                }
+                resp = s.get(REMAX_API_URL, params=params, timeout=20)
+                resp.raise_for_status()
+                items = (resp.json().get("data") or {}).get("data") or []
+                if not items:
+                    break
 
-        resp = requests.get(base_url, params=params, headers=headers, timeout=15)
-        resp.raise_for_status()
+                for it in items:
+                    prop = _item_a_propiedad(it)
+                    if prop is None:
+                        continue
+                    if not (precio_min <= prop.precio_usd <= precio_max):
+                        continue
+                    if barrios_lower and prop.barrio.lower() not in barrios_lower:
+                        continue
+                    out.append(prop)
+                    if len(out) >= max_resultados:
+                        _aplicar_dom(out)
+                        return out
 
-        # ReMax usa carga dinámica (React) — el scraping estático captura poco.
-        # Para resultados completos, usar el modo Playwright autenticado.
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Intenta parsear las tarjetas si la carga estática incluye datos
-        resultados: list[PropiedadRemax] = []
-        tarjetas = soup.select("[data-testid='listing-card']")
-
-        for i, tarjeta in enumerate(tarjetas[:max_resultados]):
-            try:
-                titulo_el = tarjeta.select_one("h2, .listing-title, [data-testid='listing-title']")
-                precio_el = tarjeta.select_one(".listing-price, [data-testid='listing-price']")
-                # Parseo básico — se expande según estructura real del HTML
-                titulo = titulo_el.get_text(strip=True) if titulo_el else f"Propiedad {i+1}"
-                precio_texto = precio_el.get_text(strip=True) if precio_el else "USD 0"
-                precio = float("".join(c for c in precio_texto if c.isdigit() or c == ".") or 0)
-
-                resultados.append(PropiedadRemax(
-                    id=f"RM-WEB-{i+1:04d}",
-                    titulo=titulo,
-                    barrio=barrios[0] if barrios else "CABA",
-                    zona="CABA",
-                    tipo="Departamento",
-                    operacion="Venta",
-                    precio_usd=precio,
-                    superficie_m2=0,
-                    ambientes=0,
-                    dormitorios=0,
-                    banos=0,
-                    expensas_ars=0,
-                    antiguedad_anos=0,
-                    dias_en_mercado=0,
-                    url=resp.url,
-                ))
-            except Exception:
-                continue
-
-        return resultados
-
-    except Exception:
-        return []
-
-
-# ─── Scraper autenticado (Playwright) ────────────────────────────────────────
-
-def _scrape_autenticado(
-    barrios: list[str] | None = None,
-    precio_min: int = 50_000,
-    precio_max: int = 500_000,
-    max_resultados: int = 50,
-) -> list[PropiedadRemax]:
-    """
-    Scraping con sesión autenticada usando Playwright.
-    Requiere REMAX_EMAIL y REMAX_PASSWORD en .env.
-    """
-    if not settings.remax_scraper_configurado:
-        return []
-
-    try:
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            ctx = browser.new_context(locale="es-AR")
-            page = ctx.new_page()
-
-            # 1. Login
-            page.goto("https://www.remax.com.ar/login", timeout=30_000)
-            page.fill("input[name='email']", settings.REMAX_EMAIL)
-            page.fill("input[name='password']", settings.REMAX_PASSWORD)
-            page.click("button[type='submit']")
-            page.wait_for_load_state("networkidle", timeout=15_000)
-
-            # 2. Navegar al portal de propiedades
-            page.goto(
-                f"https://www.remax.com.ar/listings/buy"
-                f"?priceMin={precio_min}&priceMax={precio_max}",
-                timeout=30_000,
-            )
-            page.wait_for_load_state("networkidle", timeout=15_000)
-
-            # 3. Scraping de tarjetas
-            resultados: list[PropiedadRemax] = []
-            tarjetas = page.query_selector_all("[data-testid='listing-card']")
-
-            for i, tarjeta in enumerate(tarjetas[:max_resultados]):
-                try:
-                    titulo = tarjeta.query_selector("h2")
-                    precio = tarjeta.query_selector("[data-testid='listing-price']")
-                    superficie = tarjeta.query_selector("[data-testid='listing-surface']")
-                    barrio_el = tarjeta.query_selector("[data-testid='listing-location']")
-                    url_el = tarjeta.query_selector("a")
-
-                    titulo_txt = titulo.inner_text() if titulo else f"Propiedad {i+1}"
-                    precio_txt = precio.inner_text() if precio else "USD 0"
-                    sup_txt = superficie.inner_text() if superficie else "0 m²"
-                    barrio_txt = barrio_el.inner_text() if barrio_el else "Buenos Aires"
-                    href = url_el.get_attribute("href") if url_el else ""
-
-                    precio_val = float("".join(c for c in precio_txt if c.isdigit() or c == ".") or 0)
-                    sup_val = float("".join(c for c in sup_txt if c.isdigit() or c == ".") or 0)
-
-                    resultados.append(PropiedadRemax(
-                        id=f"RM-LIVE-{i+1:04d}",
-                        titulo=titulo_txt,
-                        barrio=barrio_txt.split(",")[0].strip(),
-                        zona="CABA",
-                        tipo="Departamento",
-                        operacion="Venta",
-                        precio_usd=precio_val,
-                        superficie_m2=sup_val,
-                        ambientes=0,
-                        dormitorios=0,
-                        banos=0,
-                        expensas_ars=0,
-                        antiguedad_anos=0,
-                        dias_en_mercado=0,
-                        url=f"https://www.remax.com.ar{href}" if href else "",
-                    ))
-                except Exception:
-                    continue
-
-            browser.close()
-            return resultados
+        _aplicar_dom(out)
+        return out
 
     except Exception:
         return []
@@ -582,24 +620,24 @@ def buscar_propiedades(
 
     Retorna:
         (lista_propiedades, modo_usado)
-        modo_usado: "live_auth" | "live_publico" | "demo"
+        modo_usado: "live_api" | "demo"
     """
     precio_min = precio_min or settings.SCANNER_PRECIO_MIN_USD
     precio_max = precio_max or settings.SCANNER_PRECIO_MAX_USD
     max_resultados = max_resultados or settings.SCANNER_MAX_PROPIEDADES
 
-    # Intento 1: scraping autenticado
-    if settings.remax_scraper_configurado:
-        resultados = _scrape_autenticado(barrios, precio_min, precio_max, max_resultados)
-        if resultados:
-            return _filtrar(resultados, barrios, operacion), "live_auth"
+    # "Pozo" no es una operación distinguible en el API → usamos los datos demo,
+    # que sí incluyen unidades en pozo de ejemplo.
+    if operacion and operacion.lower() == "pozo":
+        mock = _generar_mock_propiedades()
+        return _filtrar(mock, barrios, "pozo"), "demo"
 
-    # Intento 2: scraping público
-    resultados = _scrape_publico(barrios, precio_min, precio_max, tipo, max_resultados)
+    # Live: API pública de ReMax Argentina (sin login, ya filtra precio/barrio).
+    resultados = _scrape_api(barrios, precio_min, precio_max, operacion, max_resultados)
     if resultados:
-        return _filtrar(resultados, barrios, operacion), "live_publico"
+        return resultados, "live_api"
 
-    # Fallback: mock data
+    # Fallback: datos demo.
     mock = _generar_mock_propiedades()
     return _filtrar(mock, barrios, operacion), "demo"
 

@@ -57,6 +57,11 @@ class MetricasInversion:
     highlights: list[str] = field(default_factory=list)
     alertas: list[str] = field(default_factory=list)
 
+    # Calidad de datos (relevante con datos en vivo: precios placeholder,
+    # alquileres mal etiquetados como venta, m² con errores de carga, etc.)
+    datos_validos: bool = True
+    motivo_descarte: str = ""
+
 
 # ─── Parámetros de análisis ───────────────────────────────────────────────────
 
@@ -129,6 +134,46 @@ def _calcular_revalorizacion(barrio: str, tipo_prop: str, antiguedad: int) -> fl
     return round(base, 1)
 
 
+# Umbrales de plausibilidad para detectar datos erróneos en listados en vivo
+_PRECIO_VENTA_MIN_USD = 20_000       # una venta real difícilmente baje de esto
+_PRECIO_M2_MIN_USD = 200             # USD/m² mínimo plausible (venta)
+_SUP_MIN_M2 = 10                     # m² mínimo para depto/PH/oficina
+_SUP_MAX_M2 = 1_500                  # m² máximo para depto/PH/oficina
+_RATIO_BENCH_MIN = 0.45             # < -55% vs barrio ⇒ casi siempre dato erróneo
+_RATIO_BENCH_MAX = 3.0              # > +200% vs barrio ⇒ outlier / error
+
+
+def _validar_datos(p: PropiedadRemax, precio_m2: float, bench: Optional[dict]) -> tuple[bool, list[str]]:
+    """
+    Detecta listados con datos implausibles (precio placeholder, alquiler
+    mal etiquetado como venta, m² con error de carga). Devuelve (es_valido, motivos).
+
+    Sin estos guardas, un precio/m² -99% vs barrio puntúa como "ganga" Grade A,
+    cuando casi siempre es basura de datos. Es el modo de falla más común al
+    correr el scanner contra el sistema real de ReMax.
+    """
+    motivos: list[str] = []
+
+    if p.operacion == "Venta":
+        if 0 < p.precio_usd < _PRECIO_VENTA_MIN_USD:
+            motivos.append(f"Precio inusualmente bajo para venta (USD {p.precio_usd:,.0f})")
+        if precio_m2 and precio_m2 < _PRECIO_M2_MIN_USD:
+            motivos.append(f"Precio/m² implausible (USD {precio_m2:,.0f}/m²)")
+
+    if p.tipo in ("Departamento", "PH", "Oficina") and p.superficie_m2:
+        if p.superficie_m2 < _SUP_MIN_M2 or p.superficie_m2 > _SUP_MAX_M2:
+            motivos.append(f"Superficie atípica ({p.superficie_m2:.0f} m²)")
+
+    if bench and precio_m2 and bench.get("avg", 0) > 0:
+        ratio = precio_m2 / bench["avg"]
+        if ratio < _RATIO_BENCH_MIN:
+            motivos.append(f"Precio/m² {(ratio - 1) * 100:+.0f}% vs barrio (posible error de carga)")
+        elif ratio > _RATIO_BENCH_MAX:
+            motivos.append(f"Precio/m² {(ratio - 1) * 100:+.0f}% vs barrio (outlier)")
+
+    return (len(motivos) == 0, motivos)
+
+
 def _calcular_grade(score: float) -> tuple[str, str]:
     """Convierte score 0-100 en grade y color."""
     if score >= 80:
@@ -173,9 +218,28 @@ def analizar_propiedad(
     metricas.precio_m2_etiqueta = etiqueta
     metricas.precio_m2_color = color
 
+    # ── Validación de calidad de datos ────────────────────────────────────────
+    # Si el listado tiene datos implausibles, lo marcamos y lo mandamos al fondo
+    # (Grade F, score 0) en lugar de premiarlo como "ganga".
+    metricas.datos_validos, motivos = _validar_datos(propiedad, metricas.precio_m2_usd, bench)
+    if not metricas.datos_validos:
+        metricas.motivo_descarte = "; ".join(motivos)
+        metricas.alertas.extend(motivos)
+        metricas.precio_m2_etiqueta = "Dato sospechoso"
+        metricas.precio_m2_color = "#888888"
+        metricas.score = 0.0
+        metricas.grade, metricas.grade_color = "F", "#e74c3c"
+        return metricas
+
     # ── Alquiler estimado ─────────────────────────────────────────────────────
-    yield_m = params.yield_mensual_por_zona.get(propiedad.zona, 0.004)
-    metricas.alquiler_estimado_mensual_usd = round(propiedad.precio_usd * yield_m, 0)
+    # Usamos el yield bruto anual del barrio (varía por zona) en vez de un % plano,
+    # para que la rentabilidad realmente diferencie barrios.
+    if bench and bench.get("rentabilidad_pct"):
+        yield_anual = bench["rentabilidad_pct"] / 100.0
+        metricas.alquiler_estimado_mensual_usd = round(propiedad.precio_usd * yield_anual / 12, 0)
+    else:
+        yield_m = params.yield_mensual_por_zona.get(propiedad.zona, 0.004)
+        metricas.alquiler_estimado_mensual_usd = round(propiedad.precio_usd * yield_m, 0)
 
     # ── Rentabilidad ──────────────────────────────────────────────────────────
     if propiedad.operacion == "Venta" and metricas.alquiler_estimado_mensual_usd > 0:
@@ -248,7 +312,7 @@ def analizar_propiedad(
     if propiedad.dias_en_mercado > 60:
         score += 10
         metricas.highlights.append(f"Larga estadía en mercado → mayor margen negociación (~{margen:.0f}%)")
-    elif propiedad.dias_en_mercado <= 5:
+    elif 0 < propiedad.dias_en_mercado <= 5:
         score -= 5
 
     # +/- por antigüedad y estado
@@ -287,10 +351,15 @@ def resumen_portfolio(metricas_list: list[MetricasInversion]) -> dict:
     if not metricas_list:
         return {}
 
-    precios = [m.propiedad.precio_usd for m in metricas_list]
-    m2s = [m.precio_m2_usd for m in metricas_list if m.precio_m2_usd > 0]
-    rents = [m.rentabilidad_bruta_pct for m in metricas_list if m.rentabilidad_bruta_pct > 0]
-    comisiones = [m.neto_agente_usd for m in metricas_list if m.neto_agente_usd > 0]
+    # Las estadísticas se calculan solo sobre listados con datos válidos, para
+    # que los precios placeholder / errores de carga no contaminen los promedios.
+    validas = [m for m in metricas_list if m.datos_validos]
+    base = validas or metricas_list
+
+    precios = [m.propiedad.precio_usd for m in base]
+    m2s = [m.precio_m2_usd for m in base if m.precio_m2_usd > 0]
+    rents = [m.rentabilidad_bruta_pct for m in base if m.rentabilidad_bruta_pct > 0]
+    comisiones = [m.neto_agente_usd for m in base if m.neto_agente_usd > 0]
 
     grades_count = {}
     for m in metricas_list:
@@ -298,6 +367,8 @@ def resumen_portfolio(metricas_list: list[MetricasInversion]) -> dict:
 
     return {
         "total_propiedades": len(metricas_list),
+        "validas": len(validas),
+        "descartados": len(metricas_list) - len(validas),
         "precio_promedio_usd": round(sum(precios) / len(precios), 0) if precios else 0,
         "precio_min_usd": min(precios) if precios else 0,
         "precio_max_usd": max(precios) if precios else 0,
@@ -306,9 +377,9 @@ def resumen_portfolio(metricas_list: list[MetricasInversion]) -> dict:
         "comision_total_estimada_usd": round(sum(comisiones), 0),
         "comision_promedio_usd": round(sum(comisiones) / len(comisiones), 0) if comisiones else 0,
         "grades": grades_count,
-        "top_barrios": _top_barrios(metricas_list),
-        "gangas": [m for m in metricas_list if "Ganga" in m.precio_m2_etiqueta],
-        "alto_dom": [m for m in metricas_list if m.propiedad.dias_en_mercado > 60],
+        "top_barrios": _top_barrios(validas),
+        "gangas": [m for m in validas if "Ganga" in m.precio_m2_etiqueta],
+        "alto_dom": [m for m in validas if m.propiedad.dias_en_mercado > 60],
     }
 
 

@@ -145,12 +145,11 @@ with col_btn:
         use_container_width=True,
     )
 with col_info:
-    if not settings.remax_scraper_configurado:
-        st.info(
-            "Modo demo activo. Configurá REMAX_EMAIL y REMAX_PASSWORD en .env "
-            "para scrapear ReMax.com.ar en tiempo real.",
-            icon="ℹ️",
-        )
+    st.info(
+        "El scanner consulta la API pública de ReMax Argentina en tiempo real "
+        "(sin login). Si no hay conexión, usa datos demo automáticamente.",
+        icon="ℹ️",
+    )
 
 # ── Resultado del scan ─────────────────────────────────────────────────────────
 if run_scan or "remax_metricas" in st.session_state:
@@ -185,8 +184,7 @@ if run_scan or "remax_metricas" in st.session_state:
         st.session_state["remax_barrios"] = barrios_sel if filtrar_barrios else []
 
         modo_label = {
-            "live_auth": "ReMax.com.ar (autenticado)",
-            "live_publico": "ReMax.com.ar (publico)",
+            "live_api": "ReMax Argentina (API en vivo)",
             "demo": "Datos demo",
         }.get(modo, modo)
 
@@ -207,6 +205,14 @@ if run_scan or "remax_metricas" in st.session_state:
     k3.metric("Precio/m² prom.", f"USD {resumen['m2_promedio_usd']:,.0f}")
     k4.metric("Renta prom.", f"{resumen['rentabilidad_promedio_pct']:.1f}%")
     k5.metric("Comision total est.", f"USD {resumen['comision_total_estimada_usd']:,.0f}")
+
+    descartados = resumen.get("descartados", 0)
+    if descartados:
+        st.caption(
+            f"⚠️ {descartados} listado(s) marcados como dato sospechoso "
+            "(precio/m² implausible, superficie atípica o precio placeholder) "
+            "y excluidos de los promedios — figuran al fondo como Grade F."
+        )
 
     # Grades
     grades = resumen.get("grades", {})

@@ -12,6 +12,9 @@ __pycache__/
 # Credenciales Google (contiene service account keys)
 credentials/*.json
 
+# Seguimiento local de días en mercado (DOM) — estado runtime
+data/
+
 # IDE
 .vscode/
 .idea/
