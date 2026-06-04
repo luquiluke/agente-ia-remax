@@ -136,8 +136,10 @@ def generar_texto_whatsapp(metricas_list: list[MetricasInversion]) -> str:
             f"Precio/m2: USD {m.precio_m2_usd:,.0f} ({m.precio_m2_etiqueta})",
             f"Renta estimada: {m.rentabilidad_bruta_pct:.1f}% bruta",
             f"Grade: {m.grade}",
-            "",
         ]
+        if p.url:
+            lineas.append(f"Ver: {p.url}")
+        lineas.append("")
 
     lineas.append("_Generado por Agente IA ReMax_")
     return "\n".join(lineas)
@@ -170,9 +172,14 @@ def _construir_html(
         p = m.propiedad
         grade_color = m.grade_color
         precio_color = m.precio_m2_color
+        barrio_cell = (
+            f'<a href="{p.url}" target="_blank" '
+            f'style="color:#003DA5;font-weight:bold;text-decoration:none">{p.barrio} &#8599;</a>'
+            if p.url else p.barrio
+        )
         top_rows += f"""
         <tr>
-          <td style="padding:8px;border-bottom:1px solid #eee">{p.barrio}</td>
+          <td style="padding:8px;border-bottom:1px solid #eee">{barrio_cell}</td>
           <td style="padding:8px;border-bottom:1px solid #eee">{p.tipo}</td>
           <td style="padding:8px;border-bottom:1px solid #eee">USD {p.precio_usd:,.0f}</td>
           <td style="padding:8px;border-bottom:1px solid #eee;color:{precio_color}">

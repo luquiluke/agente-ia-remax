@@ -237,6 +237,13 @@ if run_scan or "remax_metricas" in st.session_state:
 
     for col, m in zip(tcols, top_3):
         p = m.propiedad
+        link_html = (
+            f"<div style='margin-top:8px'>"
+            f"<a href='{p.url}' target='_blank' rel='noopener' "
+            f"style='color:{REMAX_RED};font-size:12px;font-weight:bold;text-decoration:none'>"
+            f"Ver publicacion en ReMax ↗</a></div>"
+            if p.url else ""
+        )
         with col:
             st.markdown(f"""
 <div class='highlight-card'>
@@ -259,6 +266,7 @@ if run_scan or "remax_metricas" in st.session_state:
     <span class='grade-badge' style='background:{m.grade_color}'>Grade {m.grade}</span>
     <span style='font-size:11px;color:#888'> Score {m.score:.0f}/100</span>
   </div>
+  {link_html}
 </div>
 """, unsafe_allow_html=True)
             if m.highlights:
@@ -290,6 +298,7 @@ if run_scan or "remax_metricas" in st.session_state:
             "Comision neta": f"USD {m.neto_agente_usd:,.0f}",
             "Grade": m.grade,
             "Score": m.score,
+            "Ver": p.url,
         })
 
     df = pd.DataFrame(tabla_data)
@@ -306,6 +315,9 @@ if run_scan or "remax_metricas" in st.session_state:
         column_config={
             "Score": st.column_config.ProgressColumn(
                 "Score", min_value=0, max_value=100, format="%.0f"
+            ),
+            "Ver": st.column_config.LinkColumn(
+                "Ver", display_text="Abrir ↗", help="Abrir la publicación en ReMax"
             ),
         },
     )
