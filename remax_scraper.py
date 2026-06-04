@@ -407,6 +407,7 @@ def _generar_mock_propiedades() -> list[PropiedadRemax]:
 # confiable que parsear el HTML renderizado o automatizar el login con Playwright.
 
 REMAX_API_URL = "https://api-ar.redremax.com/remaxweb-ar/api/listings/findAll"
+REMAX_DETAIL_URL = "https://api-ar.redremax.com/remaxweb-ar/api/listings/findById"
 REMAX_API_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -545,6 +546,73 @@ def _aplicar_dom(propiedades: list[PropiedadRemax]) -> None:
         _save_first_seen(store)
 
 
+# ─── Enriquecimiento con el endpoint de detalle ───────────────────────────────
+# El listado (findAll) no trae antigüedad, dormitorios ni cochera. El detalle
+# (findById/{uuid}) sí, a costa de una request extra por propiedad. Lo hacemos
+# en paralelo y best-effort: si falla, queda la data del listado.
+
+def _fetch_detalle(uuid: str) -> dict:
+    try:
+        import requests
+        r = requests.get(f"{REMAX_DETAIL_URL}/{uuid}", headers=REMAX_API_HEADERS, timeout=15)
+        r.raise_for_status()
+        return r.json().get("data") or {}
+    except Exception:
+        return {}
+
+
+def _enriquecer_una(prop: PropiedadRemax, uuid: str) -> None:
+    d = _fetch_detalle(uuid)
+    if not d:
+        return
+    cy = date.today().year
+
+    yb = d.get("yearBuilt")
+    if isinstance(yb, (int, float)) and yb > 1800:
+        prop.antiguedad_anos = max(cy - int(yb), 0)
+        prop.entrega_estimada = f"Q4 {int(yb)}" if yb > cy else prop.entrega_estimada
+
+    # El flag `pozo` del API aparece hasta en propiedades viejas, así que solo lo
+    # tomamos como pozo real si el año de construcción lo respalda (actual/futuro).
+    if d.get("pozo") and (yb is None or (isinstance(yb, (int, float)) and yb >= cy)):
+        prop.es_pozo = True
+
+    bedrooms = d.get("bedrooms")
+    if isinstance(bedrooms, (int, float)) and bedrooms > 0:
+        prop.dormitorios = int(bedrooms)
+
+    parking = d.get("parkingSpaces")
+    if isinstance(parking, (int, float)):
+        prop.cochera = int(parking) > 0
+
+    feats = d.get("features")
+    if isinstance(feats, list) and feats:
+        nombres = [f.get("value") for f in feats if isinstance(f, dict) and f.get("value")]
+        if nombres:
+            prop.amenities = nombres[:10]
+
+    desc = d.get("description")
+    if isinstance(desc, str) and desc.strip():
+        prop.descripcion = desc.strip()[:500]
+
+
+def _enriquecer_detalles(props: list[PropiedadRemax], uuids: list[str]) -> None:
+    """Completa antigüedad, dormitorios, cochera y amenities desde el detalle."""
+    pares = [(p, u) for p, u in zip(props, uuids) if u]
+    if not pares:
+        return
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(lambda pu: _enriquecer_una(*pu), pares))
+    except Exception:
+        for p, u in pares:  # fallback secuencial
+            try:
+                _enriquecer_una(p, u)
+            except Exception:
+                continue
+
+
 def _scrape_api(
     barrios: list[str] | None = None,
     precio_min: int = 50_000,
@@ -552,13 +620,15 @@ def _scrape_api(
     operacion: str = "venta",
     max_resultados: int = 50,
     page_cap: int = 12,
+    enriquecer: bool = True,
 ) -> list[PropiedadRemax]:
     """
     Trae propiedades desde la API pública de ReMax Argentina (sin login).
 
     El servidor ignora los filtros de precio y ubicación, así que paginamos
     sobre los listados más nuevos y filtramos en el cliente por precio y barrio.
-    Retorna lista vacía si falla — la app cae a mock data.
+    Luego enriquecemos cada propiedad con el endpoint de detalle (antigüedad,
+    dormitorios, cochera, amenities). Retorna lista vacía si falla.
     """
     try:
         import requests
@@ -567,10 +637,14 @@ def _scrape_api(
         barrios_lower = {b.lower() for b in barrios} if barrios else None
         page_size = 50
         out: list[PropiedadRemax] = []
+        uuids: list[str] = []
+        done = False
 
         with requests.Session() as s:
             s.headers.update(REMAX_API_HEADERS)
             for page in range(page_cap):
+                if done:
+                    break
                 params = {
                     "page": page,
                     "pageSize": page_size,
@@ -594,10 +668,13 @@ def _scrape_api(
                     if barrios_lower and prop.barrio.lower() not in barrios_lower:
                         continue
                     out.append(prop)
+                    uuids.append(it.get("id") or "")
                     if len(out) >= max_resultados:
-                        _aplicar_dom(out)
-                        return out
+                        done = True
+                        break
 
+        if enriquecer:
+            _enriquecer_detalles(out, uuids)
         _aplicar_dom(out)
         return out
 
