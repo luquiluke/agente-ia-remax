@@ -59,15 +59,17 @@ with st.sidebar:
     st.markdown(f"<h3 style='color:{REMAX_RED}'>Parametros del Scanner</h3>", unsafe_allow_html=True)
     st.divider()
 
-    # Barrios
-    barrios_por_zona = get_barrios_by_zona()
-    todos_barrios = get_barrios_list()
+    # ── Ubicación ──────────────────────────────────────────────────────────
+    st.markdown("**Ubicacion**")
+    ZONAS = ["CABA", "GBA Norte", "GBA Oeste", "GBA Sur"]
+    zonas_sel = st.multiselect("Zona", ZONAS, default=[], help="Vacio = todas las zonas")
 
+    barrios_por_zona = get_barrios_by_zona()
     filtrar_barrios = st.checkbox("Filtrar por barrios", value=False)
     barrios_sel = []
     if filtrar_barrios:
-        zona_sel = st.selectbox("Zona", list(barrios_por_zona.keys()))
-        barrios_zona = barrios_por_zona.get(zona_sel, [])
+        zona_nav = st.selectbox("Zona del barrio", list(barrios_por_zona.keys()))
+        barrios_zona = barrios_por_zona.get(zona_nav, [])
         barrios_sel = st.multiselect(
             "Barrios",
             barrios_zona,
@@ -76,7 +78,7 @@ with st.sidebar:
 
     st.divider()
 
-    # Precios
+    # ── Precio y operación ─────────────────────────────────────────────────
     st.markdown("**Rango de precio (USD)**")
     col1, col2 = st.columns(2)
     with col1:
@@ -84,8 +86,32 @@ with st.sidebar:
     with col2:
         precio_max = st.number_input("Max", value=500_000, step=10_000, format="%d")
 
-    # Operación
     operacion = st.selectbox("Operacion", ["Todos", "Venta", "Alquiler", "Pozo"])
+
+    st.divider()
+
+    # ── Tipo y características ──────────────────────────────────────────────
+    st.markdown("**Tipo y caracteristicas**")
+    TIPOS = ["Departamento", "Casa", "PH", "Local", "Terreno", "Oficina"]
+    tipos_sel = st.multiselect("Tipo de propiedad", TIPOS, default=[], help="Vacio = todos los tipos")
+
+    ambientes_min = st.number_input(
+        "Ambientes minimos", value=0, min_value=0, max_value=10, step=1, help="0 = sin filtro"
+    )
+    c_m2a, c_m2b = st.columns(2)
+    with c_m2a:
+        m2_min = st.number_input("m² min", value=0, min_value=0, step=10, format="%d")
+    with c_m2b:
+        m2_max = st.number_input("m² max", value=0, min_value=0, step=10, format="%d", help="0 = sin tope")
+
+    cochera_filtro = st.selectbox("Cochera", ["Indistinto", "Con cochera", "Sin cochera"])
+
+    st.divider()
+
+    # ── Filtro de oportunidad (post-análisis) ──────────────────────────────
+    st.markdown("**Oportunidad**")
+    grade_min = st.selectbox("Grade minimo", ["Todos", "A", "B", "C", "D"])
+    ocultar_sospechosos = st.checkbox("Ocultar datos sospechosos", value=True)
 
     st.divider()
 
@@ -119,7 +145,7 @@ with st.sidebar:
     st.divider()
     st.markdown("**Estado de integraciones**")
     st.markdown(f"{'✅' if settings.OPENAI_API_KEY else '❌'} OpenAI")
-    st.markdown(f"{'✅' if settings.remax_scraper_configurado else '⚠️'} ReMax scraper {'(live)' if settings.remax_scraper_configurado else '(demo)'}")
+    st.markdown("✅ ReMax scraper (API en vivo)")
     st.markdown(f"{'✅' if settings.google_configurado else '⚠️'} Google Sheets {'(live)' if settings.google_configurado else '(demo)'}")
     st.markdown(f"{'✅' if settings.gmail_configurado else '⚠️'} Gmail {'(live)' if settings.gmail_configurado else '(demo)'}")
 
@@ -162,6 +188,16 @@ if run_scan or "remax_metricas" in st.session_state:
             tc_blue=tc_blue,
         )
 
+        # Filtros a nivel propiedad (zona/tipo/ambientes/m²) → se aplican al scrapear
+        filtros = {
+            "zonas": set(zonas_sel) or None,
+            "tipos": set(tipos_sel) or None,
+            "ambientes_min": int(ambientes_min) or None,
+            "m2_min": int(m2_min) or None,
+            "m2_max": int(m2_max) or None,
+        }
+        filtros = {k: v for k, v in filtros.items() if v}
+
         with st.spinner("Buscando propiedades..."):
             propiedades, modo = buscar_propiedades(
                 barrios=barrios_sel if filtrar_barrios and barrios_sel else None,
@@ -169,6 +205,7 @@ if run_scan or "remax_metricas" in st.session_state:
                 precio_max=precio_max,
                 operacion=operacion.lower() if operacion != "Todos" else "todos",
                 max_resultados=max_props,
+                filtros=filtros or None,
             )
 
         if not propiedades:
@@ -177,6 +214,26 @@ if run_scan or "remax_metricas" in st.session_state:
 
         with st.spinner(f"Analizando {len(propiedades)} propiedades..."):
             metricas_list = analizar_portfolio(propiedades, params)
+
+        # Filtros post-análisis: cochera (necesita el detalle), grade y calidad de datos.
+        if cochera_filtro == "Con cochera":
+            metricas_list = [m for m in metricas_list if m.propiedad.cochera]
+        elif cochera_filtro == "Sin cochera":
+            metricas_list = [m for m in metricas_list if not m.propiedad.cochera]
+
+        if ocultar_sospechosos:
+            metricas_list = [m for m in metricas_list if m.datos_validos]
+
+        if grade_min != "Todos":
+            _orden = {"A": 5, "B": 4, "C": 3, "D": 2, "F": 1}
+            metricas_list = [m for m in metricas_list if _orden.get(m.grade, 0) >= _orden[grade_min]]
+
+        if not metricas_list:
+            st.warning(
+                "Se encontraron propiedades pero ninguna pasó los filtros de "
+                "cochera / grade / calidad. Probá aflojar esos filtros."
+            )
+            st.stop()
 
         st.session_state["remax_metricas"] = metricas_list
         st.session_state["remax_modo"] = modo
@@ -188,7 +245,10 @@ if run_scan or "remax_metricas" in st.session_state:
             "demo": "Datos demo",
         }.get(modo, modo)
 
-        st.success(f"{len(propiedades)} propiedades encontradas y analizadas — Fuente: {modo_label}")
+        st.success(
+            f"{len(metricas_list)} de {len(propiedades)} propiedades tras filtros "
+            f"— Fuente: {modo_label}"
+        )
 
     # Recuperar del state
     metricas_list: list[MetricasInversion] = st.session_state["remax_metricas"]

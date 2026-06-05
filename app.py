@@ -136,7 +136,7 @@ with st.sidebar:
     st.divider()
     st.markdown("### Estado del sistema")
     st.markdown(f"{'✅' if settings.OPENAI_API_KEY else '❌'} OpenAI (GPT-4o-mini)")
-    st.markdown(f"{'✅' if settings.remax_scraper_configurado else '⚠️'} Scraper ReMax {'(live)' if settings.remax_scraper_configurado else '(demo)'}")
+    st.markdown("✅ Scraper ReMax (API en vivo)")
     st.markdown(f"{'✅' if settings.google_configurado else '⚠️'} Google Sheets {'(live)' if settings.google_configurado else '(demo)'}")
     st.markdown(f"{'✅' if settings.gmail_configurado else '⚠️'} Gmail {'(live)' if settings.gmail_configurado else '(demo)'}")
 

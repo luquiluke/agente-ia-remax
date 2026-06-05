@@ -613,6 +613,30 @@ def _enriquecer_detalles(props: list[PropiedadRemax], uuids: list[str]) -> None:
                 continue
 
 
+def _pasa_filtros(p: PropiedadRemax, filtros: dict | None) -> bool:
+    """Filtros a nivel propiedad que se resuelven con datos del listado
+    (zona, tipo, ambientes, superficie). La cochera necesita el detalle y se
+    filtra después, en la página."""
+    if not filtros:
+        return True
+    zonas = filtros.get("zonas")
+    if zonas and p.zona not in zonas:
+        return False
+    tipos = filtros.get("tipos")
+    if tipos and p.tipo not in tipos:
+        return False
+    amb_min = filtros.get("ambientes_min")
+    if amb_min and p.ambientes < amb_min:
+        return False
+    m2_min = filtros.get("m2_min")
+    if m2_min and p.superficie_m2 and p.superficie_m2 < m2_min:
+        return False
+    m2_max = filtros.get("m2_max")
+    if m2_max and p.superficie_m2 and p.superficie_m2 > m2_max:
+        return False
+    return True
+
+
 def _scrape_api(
     barrios: list[str] | None = None,
     precio_min: int = 50_000,
@@ -621,14 +645,16 @@ def _scrape_api(
     max_resultados: int = 50,
     page_cap: int = 12,
     enriquecer: bool = True,
+    filtros: dict | None = None,
 ) -> list[PropiedadRemax]:
     """
     Trae propiedades desde la API pública de ReMax Argentina (sin login).
 
     El servidor ignora los filtros de precio y ubicación, así que paginamos
-    sobre los listados más nuevos y filtramos en el cliente por precio y barrio.
-    Luego enriquecemos cada propiedad con el endpoint de detalle (antigüedad,
-    dormitorios, cochera, amenities). Retorna lista vacía si falla.
+    sobre los listados más nuevos y filtramos en el cliente por precio, barrio,
+    zona, tipo, ambientes y superficie. Luego enriquecemos cada propiedad con el
+    endpoint de detalle (antigüedad, dormitorios, cochera, amenities).
+    Retorna lista vacía si falla.
     """
     try:
         import requests
@@ -667,6 +693,8 @@ def _scrape_api(
                         continue
                     if barrios_lower and prop.barrio.lower() not in barrios_lower:
                         continue
+                    if not _pasa_filtros(prop, filtros):
+                        continue
                     out.append(prop)
                     uuids.append(it.get("id") or "")
                     if len(out) >= max_resultados:
@@ -691,9 +719,12 @@ def buscar_propiedades(
     tipo: str = "departamento",
     operacion: str = "venta",
     max_resultados: int | None = None,
+    filtros: dict | None = None,
 ) -> tuple[list[PropiedadRemax], str]:
     """
     Busca propiedades usando el mejor método disponible.
+
+    `filtros` (opcional) acepta: zonas, tipos, ambientes_min, m2_min, m2_max.
 
     Retorna:
         (lista_propiedades, modo_usado)
@@ -706,17 +737,17 @@ def buscar_propiedades(
     # "Pozo" no es una operación distinguible en el API → usamos los datos demo,
     # que sí incluyen unidades en pozo de ejemplo.
     if operacion and operacion.lower() == "pozo":
-        mock = _generar_mock_propiedades()
-        return _filtrar(mock, barrios, "pozo"), "demo"
+        mock = _filtrar(_generar_mock_propiedades(), barrios, "pozo")
+        return [p for p in mock if _pasa_filtros(p, filtros)], "demo"
 
     # Live: API pública de ReMax Argentina (sin login, ya filtra precio/barrio).
-    resultados = _scrape_api(barrios, precio_min, precio_max, operacion, max_resultados)
+    resultados = _scrape_api(barrios, precio_min, precio_max, operacion, max_resultados, filtros=filtros)
     if resultados:
         return resultados, "live_api"
 
     # Fallback: datos demo.
-    mock = _generar_mock_propiedades()
-    return _filtrar(mock, barrios, operacion), "demo"
+    mock = _filtrar(_generar_mock_propiedades(), barrios, operacion)
+    return [p for p in mock if _pasa_filtros(p, filtros)], "demo"
 
 
 def _filtrar(
